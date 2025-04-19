@@ -23,3 +23,4 @@ RUN cp /etc/ssh/sshd_config /etc/ssh/sshd_config-original \
 RUN apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /root
+CMD ["/bin/bash", "-c", "/usr/sbin/sshd && sleep inf"]
