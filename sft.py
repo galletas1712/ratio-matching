@@ -38,36 +38,36 @@ def print_trainable_parameters(model):
     )
 
 
-class MergeAndSaveCallback(TrainerCallback):
-    """
-    After the Trainer writes its standard checkpoint,
-    merge LoRA adapters into the base and save that too.
-    """
-
-    def on_save(self, args, state, control, **kwargs):
-        model = kwargs.get("model")
-        if isinstance(model, PeftModel):
-            print("Saving now!")
-            ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
-            merged_dir = os.path.join(ckpt_dir, "lora_merged")
-
-            merged = model.merge_and_unload()
-            merged.save_pretrained(merged_dir)
-            wandb.save(os.path.join(merged_dir, "*"), base_path=args.output_dir)
-        return control
-
-
 # --- HYDRA MAIN FUNCTION ---
 @hydra.main(version_base=None, config_path="config", config_name="sft_config")
 def main(cfg: DictConfig) -> None:
     wandb.init(
-        project=cfg.training.wandb_project,
-        name=cfg.training.run_name,
+        project=cfg.wandb.wandb_project,
+        name=cfg.wandb.run_name,
         config=OmegaConf.to_container(cfg),
         save_code=True,
     )
 
-    artifact_directory = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
+    output_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
+    
+    class MergeAndSaveCallback(TrainerCallback):
+        """
+        After the Trainer writes its standard checkpoint,
+        merge LoRA adapters into the base and save that too.
+        """
+
+        def on_save(self, args, state, control, **kwargs):
+            model = kwargs.get("model")
+            if isinstance(model, PeftModel):
+                print("Saving now!")
+                ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+                merged_dir = os.path.join(ckpt_dir, "lora_merged")
+
+                merged = model.merge_and_unload()
+                merged.save_pretrained(merged_dir)
+                if cfg.wandb.save_files:
+                    wandb.save(os.path.join(merged_dir, "*"), base_path=args.output_dir)
+            return control
 
     """Main training function driven by Hydra configuration."""
     print("-------------------- Configuration --------------------")
@@ -124,32 +124,8 @@ def main(cfg: DictConfig) -> None:
 
     # 6. Training Arguments (Reads from config)
     print("Setting up Training Arguments")
-    report_to = cfg.training.report_to
-    if isinstance(report_to, str):
-        report_to = [report_to]
-
-    training_arguments = TrainingArguments(
-        output_dir=artifact_directory,
-        save_strategy="steps",
-        save_steps=cfg.training.save_steps,
-        logging_strategy="steps",
-        logging_steps=cfg.training.logging_steps,
-        eval_strategy="steps",
-        eval_steps=cfg.training.eval_steps,
-        report_to=cfg.training.report_to,
-        run_name=cfg.training.run_name,
-        logging_first_step=True,
-        seed=cfg.training.seed,
-        num_train_epochs=cfg.training.num_train_epochs,
-        per_device_train_batch_size=cfg.training.per_device_train_batch_size,
-        gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
-        learning_rate=cfg.training.learning_rate,
-        lr_scheduler_type=cfg.training.lr_scheduler_type,
-        warmup_steps=cfg.training.warmup_steps,
-        optim=cfg.training.optim,
-        per_device_eval_batch_size=cfg.training.per_device_eval_batch_size,
-        fp16=True,
-    )
+    cfg.training.output_dir = output_dir
+    training_arguments = TrainingArguments(**cfg.training)
 
     # 7. Initialize SFTTrainer (Reads from config where applicable)
     print("Initializing SFTTrainer")
@@ -170,13 +146,10 @@ def main(cfg: DictConfig) -> None:
     print_trainable_parameters(model)
 
     # Run baseline evaluation first
-    if cfg.training.do_initial_eval:
-        print("Running baseline evaluation...")
-        baseline_metrics = trainer.evaluate()
-        trainer.log_metrics("eval_baseline", baseline_metrics)
-        trainer.save_metrics("eval_baseline", baseline_metrics)
-    else:
-        print("Skipping baseline evaluation as per config.")
+    print("Running baseline evaluation...")
+    baseline_metrics = trainer.evaluate()
+    trainer.log_metrics("eval_baseline", baseline_metrics)
+    trainer.save_metrics("eval_baseline", baseline_metrics)
 
     # debug
     # print("One-off eval: ", trainer.evaluate())
@@ -198,19 +171,21 @@ def main(cfg: DictConfig) -> None:
         f"Saving final model ({'LoRA adapter' if cfg.lora.enabled else 'Full weights'})..."
     )
     adapter_directory = os.path.join(
-        artifact_directory, "lora_adapter" if cfg.lora.enabled else "final_model"
+        output_dir, "lora_adapter" if cfg.lora.enabled else "final_model"
     )
     trainer.save_model(adapter_directory)
-    wandb.save(os.path.join(adapter_directory, "*"), base_path=artifact_directory)
+    if cfg.wandb.save_files:
+        wandb.save(os.path.join(adapter_directory, "*"), base_path=output_dir)
     print(
         f"{'PEFT' if cfg.lora.enabled else 'Final model'} checkpoint: model saved to {adapter_directory}"
     )
 
     if cfg.lora.enabled:
         merged = trainer.model.merge_and_unload()
-        merged_dir = os.path.join(artifact_directory, "lora_merged")
+        merged_dir = os.path.join(output_dir, "lora_merged")
         merged.save_pretrained(merged_dir)
-        wandb.save(os.path.join(merged_dir, "*"), base_path=artifact_directory)
+        if cfg.wandb.save_files:
+            wandb.save(os.path.join(merged_dir, "*"), base_path=output_dir)
         print(f"Finished saving the merged model to: {merged_dir}")
 
 
