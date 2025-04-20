@@ -1,0 +1,76 @@
+defaults:
+  - _self_
+
+# -- Model Configuration --
+model:
+  name: "EleutherAI/pythia-2.8b"
+  # LoRA target modules (same as SFT)
+  lora_target_modules:
+    - "query_key_value"
+    - "dense"
+    - "dense_h_to_4h"
+    - "dense_4h_to_h"
+
+# -- Dataset Configuration --
+dataset:
+  name: "Anthropic/hh-rlhf"
+  train_split: "train"
+  eval_split: "test"
+  train_size_limit: 200
+  eval_size_limit: 100
+
+# -- LoRA Configuration --
+lora:
+  enabled: true
+  r: 32
+  lora_alpha: 32
+  lora_dropout: 0.05
+  bias: "none"
+  task_type: "CAUSAL_LM"
+  target_modules:
+    - "query_key_value"
+    - "dense"
+    - "dense_h_to_4h"
+    - "dense_4h_to_h"
+
+# -- DPO & Training Arguments --
+dpo:
+  # Hugging Face TrainingArguments & DPOConfig
+  output_dir: ???
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 1
+  learning_rate: 1e-6
+  num_train_epochs: 1
+  evaluation_strategy: "steps"
+  eval_steps: 1
+  save_strategy: "steps"
+  save_steps: 200
+  logging_strategy: "steps"
+  logging_steps: 11
+  warmup_steps: 150
+  lr_scheduler_type: "cosine"
+  optim: "adamw_torch"
+  fp16: true
+  report_to: "wandb"
+  seed: 0
+  remove_unused_columns: false
+
+  # DPO-specific hyperparameters
+  loss_type: "sigmoid"
+  beta: 0.1
+  f_divergence_type: "reverse_kl"
+  generate_during_eval: false
+  disable_dropout: true
+  sync_ref_model: false
+  ref_model_sync_steps: 512
+
+# -- WandB & Misc --
+wandb:
+  wandb_project: "dpo-lora"
+  run_name: "pythia-2.8b-dpo-lora-debug"
+
+# -- Hydra Run Configuration --
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
