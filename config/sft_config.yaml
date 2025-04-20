@@ -6,8 +6,6 @@ defaults:
 # -- Model Configuration --
 model:
   name: "EleutherAI/pythia-2.8b"
-  tokenizer_name_or_path: null
-  trust_remote_code: true
 
   # For LoRA, target modules depend on the model architecture.
   # These are typical for Pythia/GPT-NeoX. Use print(model) to inspect your model's layers.
@@ -19,10 +17,10 @@ model:
 
 # -- Dataset Configuration --
 dataset:
-  name: "claserken/hhrlhf-rejudged"
+  name: "Anthropic/hh-rlhf"
   sft_column: "chosen"
-  eval_size_limit: 10
-  train_size_limit: 10
+  eval_size_limit: 100
+  train_size_limit: 200
 
 # -- LoRA Configuration --
 lora:
@@ -35,10 +33,9 @@ lora:
 
 # -- Training Arguments --
 training:
-  output_dir: "./outputs"
   per_device_train_batch_size: 8
-  per_device_eval_batch_size: 32
-  gradient_accumulation_steps: 8
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 1
   learning_rate: 1e-4 # LoRA often tolerates slightly higher LR than full fine-tuning (adjust as needed)
   num_train_epochs: 1
   eval_strategy: "steps"
@@ -54,7 +51,7 @@ training:
   remove_unused_columns: false
   seed: 0
   
-  do_initial_eval: false  # TODO: set to true to get baseline
+  do_initial_eval: true
 
 # -- Hydra Run Configuration --
 hydra:

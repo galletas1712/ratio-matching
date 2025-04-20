@@ -1,27 +1,27 @@
 import os
-import wandb
+
+import hydra
 import torch
 from datasets import load_dataset
-from peft import PeftModel
-from transformers import TrainerCallback
+from omegaconf import DictConfig, OmegaConf, listconfig
+from peft import (
+    LoraConfig,  # Import LoraConfig
+    PeftModel,
+)
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    TrainerCallback,
     TrainingArguments,
     # BitsAndBytesConfig # Keep commented unless adding quantization (QLoRA)
 )
-# --- PEFT Import ---
-from peft import LoraConfig # Import LoraConfig
-# --- End PEFT Import ---
 from trl import SFTTrainer
 
-# --- HYDRA / OMEGACONF IMPORTS ---
-import hydra
-from omegaconf import DictConfig, OmegaConf, listconfig
-# --- END HYDRA IMPORTS ---
+import wandb
 
 # Check for TOKENIZERS_PARALLELISM environment variable
 os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get("TOKENIZERS_PARALLELISM", "false")
+
 
 def print_trainable_parameters(model):
     """
@@ -36,32 +36,39 @@ def print_trainable_parameters(model):
     print(
         f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
     )
-    
+
+
 class MergeAndSaveCallback(TrainerCallback):
     """
     After the Trainer writes its standard checkpoint,
     merge LoRA adapters into the base and save that too.
     """
+
     def on_save(self, args, state, control, **kwargs):
         model = kwargs.get("model")
         if isinstance(model, PeftModel):
-            print(f"Saving now!")
+            print("Saving now!")
             ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
-            merged_dir = os.path.join(ckpt_dir, "merged")
-            
+            merged_dir = os.path.join(ckpt_dir, "lora_merged")
+
             merged = model.merge_and_unload()
             merged.save_pretrained(merged_dir)
+            wandb.save(os.path.join(merged_dir, "*"), base_path=args.output_dir)
         return control
 
+
 # --- HYDRA MAIN FUNCTION ---
-@hydra.main(version_base=None, config_path="config", config_name="config")
+@hydra.main(version_base=None, config_path="config", config_name="sft_config")
 def main(cfg: DictConfig) -> None:
     wandb.init(
         project=cfg.training.wandb_project,
         name=cfg.training.run_name,
         config=OmegaConf.to_container(cfg),
+        save_code=True,
     )
-    
+
+    artifact_directory = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
+
     """Main training function driven by Hydra configuration."""
     print("-------------------- Configuration --------------------")
     print(OmegaConf.to_yaml(cfg))
@@ -70,34 +77,22 @@ def main(cfg: DictConfig) -> None:
     # 2. Load Dataset
     print(f"Loading dataset: {cfg.dataset.name}")
     train_dataset = load_dataset(cfg.dataset.name, split="train")
-    if 'train_size_limit' in cfg.dataset and cfg.dataset.train_size_limit:
+    if "train_size_limit" in cfg.dataset and cfg.dataset.train_size_limit:
         train_dataset = train_dataset.select(range(cfg.dataset.train_size_limit))
-        
+
     eval_dataset = load_dataset(cfg.dataset.name, split="test")
-    if 'eval_size_limit' in cfg.dataset and cfg.dataset.eval_size_limit:
+    if "eval_size_limit" in cfg.dataset and cfg.dataset.eval_size_limit:
         eval_dataset = eval_dataset.select(range(cfg.dataset.eval_size_limit))
-        
+
     print("Dataset loaded.")
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Eval dataset size: {len(eval_dataset)}")
-    
-    model_kwargs = dict(
-        trust_remote_code=cfg.model.trust_remote_code,
-        torch_dtype=torch.bfloat16,
-        # Add quantization config here if doing QLoRA in the future
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.model.name,
-        **model_kwargs
-    )
+
+    model = AutoModelForCausalLM.from_pretrained(cfg.model.name, trust_remote_code=True)
 
     # 3. Load Tokenizer and Model
     print(f"Loading model and tokenizer: {cfg.model.name}")
-    tokenizer_name = cfg.model.get("tokenizer_name_or_path") or cfg.model.name
-    tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_name,
-        trust_remote_code=cfg.model.trust_remote_code
-    )
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model.name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         print("Set tokenizer pad_token to eos_token")
@@ -105,7 +100,9 @@ def main(cfg: DictConfig) -> None:
 
     tokenizer.model_max_length = model.config.max_position_embeddings
     effective_max_length = tokenizer.model_max_length
-    print(f"Tokenizer model_max_length (used by default if not overridden): {effective_max_length}")
+    print(
+        f"Tokenizer model_max_length (used by default if not overridden): {effective_max_length}"
+    )
 
     # 5. Setup PEFT/LoRA Config (Conditionally based on config)
     peft_config = None
@@ -119,21 +116,20 @@ def main(cfg: DictConfig) -> None:
             lora_dropout=cfg.lora.lora_dropout,
             target_modules=target_modules_list,
             bias=cfg.lora.bias,
-            task_type=cfg.lora.task_type, # Should be CAUSAL_LM
+            task_type=cfg.lora.task_type,  # Should be CAUSAL_LM
         )
         print(f"LoraConfig: {peft_config}")
     else:
         print("LoRA is disabled. Performing full fine-tuning.")
-
 
     # 6. Training Arguments (Reads from config)
     print("Setting up Training Arguments")
     report_to = cfg.training.report_to
     if isinstance(report_to, str):
         report_to = [report_to]
-    
+
     training_arguments = TrainingArguments(
-        output_dir=cfg.training.output_dir,
+        output_dir=artifact_directory,
         save_strategy="steps",
         save_steps=cfg.training.save_steps,
         logging_strategy="steps",
@@ -144,7 +140,6 @@ def main(cfg: DictConfig) -> None:
         run_name=cfg.training.run_name,
         logging_first_step=True,
         seed=cfg.training.seed,
-
         num_train_epochs=cfg.training.num_train_epochs,
         per_device_train_batch_size=cfg.training.per_device_train_batch_size,
         gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
@@ -152,12 +147,8 @@ def main(cfg: DictConfig) -> None:
         lr_scheduler_type=cfg.training.lr_scheduler_type,
         warmup_steps=cfg.training.warmup_steps,
         optim=cfg.training.optim,
-
         per_device_eval_batch_size=cfg.training.per_device_eval_batch_size,
-
-        bf16=True,
-        fp16=False,
-        tf32=False,
+        fp16=True,
     )
 
     # 7. Initialize SFTTrainer (Reads from config where applicable)
@@ -167,7 +158,7 @@ def main(cfg: DictConfig) -> None:
         args=training_arguments,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        peft_config=peft_config, # Pass the LoraConfig object (or None)
+        peft_config=peft_config,  # Pass the LoraConfig object (or None)
         processing_class=tokenizer,
         formatting_func=lambda x: x[cfg.dataset.sft_column],
         callbacks=[MergeAndSaveCallback],
@@ -175,8 +166,9 @@ def main(cfg: DictConfig) -> None:
     )
 
     print("Model parameters:")
+    print(model)
     print_trainable_parameters(model)
-    
+
     # Run baseline evaluation first
     if cfg.training.do_initial_eval:
         print("Running baseline evaluation...")
@@ -188,9 +180,11 @@ def main(cfg: DictConfig) -> None:
 
     # debug
     # print("One-off eval: ", trainer.evaluate())
-    
+
     # 8. Train
-    print(f"Starting training ({'LoRA enabled' if cfg.lora.enabled else 'Full fine-tuning'})...")
+    print(
+        f"Starting training ({'LoRA enabled' if cfg.lora.enabled else 'Full fine-tuning'})..."
+    )
     if cfg.training.num_train_epochs > 0:
         train_result = trainer.train()
         metrics = train_result.metrics
@@ -199,28 +193,26 @@ def main(cfg: DictConfig) -> None:
     else:
         print("Skipping training as num_train_epochs <= 0")
 
-
     # 9. Save final model
-    print(f"Saving final model ({'LoRA adapter' if cfg.lora.enabled else 'Full weights'})...")
-    final_output_dir = training_arguments.output_dir
-    trainer.save_model(final_output_dir) # Saves adapter if PEFT used, otherwise full model
-    tokenizer.save_pretrained(final_output_dir)
-    print(f"PEFT checkpoint: model saved to {final_output_dir}")
-    
-    # saving the merged LoRA  + base model weights 
-    # We should call this to run later:
-    # model = AutoModelForCausalLM.from_pretrained("path/to/sft_lora_merged")
-    # tokenizer = AutoTokenizer.from_pretrained("path/to/sft_lora_merged")
+    print(
+        f"Saving final model ({'LoRA adapter' if cfg.lora.enabled else 'Full weights'})..."
+    )
+    adapter_directory = os.path.join(
+        artifact_directory, "lora_adapter" if cfg.lora.enabled else "final_model"
+    )
+    trainer.save_model(adapter_directory)
+    wandb.save(os.path.join(adapter_directory, "*"), base_path=artifact_directory)
+    print(
+        f"{'PEFT' if cfg.lora.enabled else 'Final model'} checkpoint: model saved to {adapter_directory}"
+    )
+
     if cfg.lora.enabled:
         merged = trainer.model.merge_and_unload()
-        merged_dir = os.path.join(final_output_dir, "sft_lora_merged")
+        merged_dir = os.path.join(artifact_directory, "lora_merged")
         merged.save_pretrained(merged_dir)
+        wandb.save(os.path.join(merged_dir, "*"), base_path=artifact_directory)
         print(f"Finished saving the merged model to: {merged_dir}")
 
 
-# --- HYDRA ENTRY POINT ---
 if __name__ == "__main__":
     main()
-# --- END HYDRA ENTRY POINT ---
-
-
