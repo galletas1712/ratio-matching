@@ -17,10 +17,10 @@ model:
 
 # -- Dataset Configuration --
 dataset:
-  name: "Anthropic/hh-rlhf"
+  name: "claserken/hhrlhf-rejudged"
   sft_column: "chosen"
-  eval_size_limit: 100
-  train_size_limit: 200
+  eval_size_limit: null
+  train_size_limit: null
 
 # -- LoRA Configuration --
 lora:
@@ -35,19 +35,19 @@ lora:
 training:
   output_dir: ???
   per_device_train_batch_size: 8
-  per_device_eval_batch_size: 8
-  gradient_accumulation_steps: 1
-  learning_rate: 1e-4 # LoRA often tolerates slightly higher LR than full fine-tuning (adjust as needed)
-  num_train_epochs: 1
+  per_device_eval_batch_size: 32
+  gradient_accumulation_steps: 32
+  learning_rate: 5e-6 # LoRA often tolerates slightly higher LR than full fine-tuning (adjust as needed)
+  num_train_epochs: 3
   logging_strategy: "steps"
   logging_first_step: true
   eval_strategy: "steps"
-  eval_steps: 1
+  eval_steps: 50
   save_strategy: "steps"
   save_steps: 200
-  logging_steps: 11
+  logging_steps: 10
   warmup_steps: 150
-  lr_scheduler_type: "cosine"
+  lr_scheduler_type: "linear"
   optim: "adamw_torch" # Standard AdamW works well for LoRA, but RMSProp is more memory efficient
   fp16: true
   report_to: "wandb"
@@ -62,4 +62,4 @@ wandb:
 # -- Hydra Run Configuration --
 hydra:
   run:
-    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: outputs/sft/${now:%Y-%m-%d}/${now:%H-%M-%S}

@@ -1,9 +1,8 @@
 import os
 
 import hydra
-import torch
 from datasets import load_dataset
-from omegaconf import DictConfig, OmegaConf, listconfig
+from omegaconf import DictConfig, OmegaConf
 from peft import (
     LoraConfig,  # Import LoraConfig
     PeftModel,
@@ -48,25 +47,22 @@ def main(cfg: DictConfig) -> None:
         save_code=True,
     )
 
-    output_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
+    output_dir = wandb.run.dir
+    cfg.training.output_dir = output_dir
     
-    class MergeAndSaveCallback(TrainerCallback):
-        """
-        After the Trainer writes its standard checkpoint,
-        merge LoRA adapters into the base and save that too.
-        """
-
+    # output_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
+    
+    class SaveAdapterCallback(TrainerCallback):
         def on_save(self, args, state, control, **kwargs):
-            model = kwargs.get("model")
+            model = kwargs["model"]
+            # only act on PeftModel (i.e. base+LoRA adapter)
             if isinstance(model, PeftModel):
-                print("Saving now!")
-                ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
-                merged_dir = os.path.join(ckpt_dir, "lora_merged")
-
-                merged = model.merge_and_unload()
-                merged.save_pretrained(merged_dir)
+                ckpt_dir    = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+                adapter_dir = os.path.join(ckpt_dir, "adapter_only")
+                # this will create adapter_dir/adapter_config.json and pytorch_model.bin
+                model.save_pretrained(adapter_dir)
                 if cfg.wandb.save_files:
-                    wandb.save(os.path.join(merged_dir, "*"), base_path=args.output_dir)
+                    wandb.save(os.path.join(adapter_dir, "*"), base_path=args.output_dir)
             return control
 
     """Main training function driven by Hydra configuration."""
@@ -137,7 +133,7 @@ def main(cfg: DictConfig) -> None:
         peft_config=peft_config,  # Pass the LoraConfig object (or None)
         processing_class=tokenizer,
         formatting_func=lambda x: x[cfg.dataset.sft_column],
-        callbacks=[MergeAndSaveCallback],
+        callbacks=[SaveAdapterCallback],
         # max_seq_length is not passed directly
     )
 
@@ -150,9 +146,6 @@ def main(cfg: DictConfig) -> None:
     baseline_metrics = trainer.evaluate()
     trainer.log_metrics("eval_baseline", baseline_metrics)
     trainer.save_metrics("eval_baseline", baseline_metrics)
-
-    # debug
-    # print("One-off eval: ", trainer.evaluate())
 
     # 8. Train
     print(
