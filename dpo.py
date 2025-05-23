@@ -14,7 +14,8 @@ from transformers import (
     AutoTokenizer,
     # BitsAndBytesConfig # Uncomment for QLoRA
 )
-from trl import DPOTrainer, DPOConfig
+from trl import DPOConfig
+from dpo_trainer import DPOTrainer
 
 import wandb
 

@@ -34,7 +34,7 @@ lora:
 # -- DPO Specific Configuration --
 dpo:
   beta: 0.1           # DPO beta parameter (controls divergence from reference model)
-  loss_type: "sigmoid" # DPO loss type ('sigmoid', 'hinge', 'ipo', 'kto_pair')
+  loss_type: "rebel" # DPO loss type ('sigmoid', 'hinge', 'ipo', 'kto_pair')
 
 # -- Training Arguments --
 training:
@@ -62,7 +62,7 @@ training:
 
 wandb:
   wandb_project: "dpo-lora"
-  run_name: "pythia-2.8b-dpo-lora-${now:%Y-%m-%d-%H-%M-%S}"
+  run_name: "pythia-2.8b-rebel-lora-${now:%Y-%m-%d-%H-%M-%S}"
   save_files: false # Set to true to save adapter checkpoints to wandb
 
 # -- Hydra Run Configuration --
