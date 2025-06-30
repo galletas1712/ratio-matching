@@ -21,7 +21,7 @@ from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Optional, Union
-
+import json
 import pandas as pd
 import torch
 import torch.amp as amp
@@ -460,6 +460,8 @@ class DPOTrainer(Trainer):
                 }
             else:
                 eval_dataset = self._prepare_dataset(eval_dataset, processing_class, args, "eval")
+                
+        self._raw_eval_margins = []
 
         super().__init__(
             model=model,
@@ -986,9 +988,10 @@ class DPOTrainer(Trainer):
             losses = (logits - reward_diffs / self.beta) ** 2
         
         elif self.loss_type == "dro":
-            f = lambda x: x - 1.0/x
+            f = lambda x: x
+            g = lambda x: x/30
             optimal_logratios = ref_logratios + (reward_diffs / self.beta)
-            losses = torch.square(f(torch.exp(optimal_logratios)) - f(torch.exp(logratios)))
+            losses = torch.square(f(torch.exp(g(optimal_logratios))) - f(torch.exp(g(logratios))))
 
         elif self.loss_type == "bco_pair":
             chosen_logratios = chosen_logps - ref_chosen_logps
@@ -1291,6 +1294,11 @@ class DPOTrainer(Trainer):
             losses = losses + self.aux_loss_coef * model_output["aux_loss"]
 
         prefix = "eval_" if train_eval == "eval" else ""
+        
+        if train_eval == "eval":
+            raw_margins = self.accelerator.gather_for_metrics((chosen_rewards - rejected_rewards)).cpu().tolist()
+            self._raw_eval_margins.extend(raw_margins)
+        
         metrics[f"{prefix}rewards/chosen"] = self.accelerator.gather_for_metrics(chosen_rewards).mean().item()
         metrics[f"{prefix}rewards/rejected"] = self.accelerator.gather_for_metrics(rejected_rewards).mean().item()
         metrics[f"{prefix}rewards/accuracies"] = self.accelerator.gather_for_metrics(reward_accuracies).mean().item()
@@ -1481,6 +1489,25 @@ class DPOTrainer(Trainer):
         initial_output = super().evaluation_loop(
             dataloader, description, prediction_loss_only, ignore_keys, metric_key_prefix
         )
+        
+        if self.is_world_process_zero():
+            os.makedirs(self.args.output_dir, exist_ok=True)
+            path = os.path.join(self.args.output_dir, "eval_margins.jsonl")
+
+            if not hasattr(self, "_jsonl_initialized"):
+                with open(path, "w", encoding="utf-8"):
+                    pass
+                self._jsonl_initialized = True
+
+            record = {"step": int(self.state.global_step), "implicit_margins": self._raw_eval_margins,}
+            
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+
+            print(f"[DPOTrainer] logged {len(self._raw_eval_margins)} implicit margins at step {self.state.global_step} -> {path}")
+        
+        # reset buffer for next eval
+        self._raw_eval_margins.clear()
 
         return initial_output
 
