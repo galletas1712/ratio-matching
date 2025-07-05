@@ -5,9 +5,10 @@ defaults:
 
 # -- Model Configuration --
 model:
-  name: "EleutherAI/pythia-2.8b" # Base model for DPO
+  name: "/root/dro/outputs/2025-07-02_08-34-24/epoch-0-step-119999" # Base model for DPO
+  tokenizer: "EleutherAI/pythia-2.8b"
   # Optional: Specify a pre-trained SFT adapter directory to load and merge before DPO
-  sft_adapter_path: "/root/dro/wandb/run-20250430_055450-r8tmrihb/files/checkpoint-1884"
+  # sft_adapter_path: "/root/dro/wandb/run-20250430_055450-r8tmrihb/files/checkpoint-1884"
 
   # For LoRA, target modules depend on the model architecture.
   lora_target_modules:
@@ -24,7 +25,7 @@ dataset:
 
 # -- LoRA Configuration (Optional, for LoRA DPO) --
 lora:
-  enabled: true       # Set to true to enable LoRA for DPO
+  enabled: false       # Set to true to enable LoRA for DPO
   r: 16               # LoRA rank (can be same or different from SFT)
   lora_alpha: 32      # LoRA alpha scaling factor
   lora_dropout: 0.05  # Dropout probability for LoRA layers
@@ -54,15 +55,15 @@ training:
   warmup_steps: 100
   lr_scheduler_type: "linear"
   optim: "adamw_torch"
-  fp16: true # Use bf16 if available and supported by hardware
-  # bf16: true # Uncomment if using Ampere or newer GPUs
+  # fp16: true # Use bf16 if available and supported by hardware
+  bf16: true # Uncomment if using Ampere or newer GPUs
   report_to: "wandb"
   remove_unused_columns: false # Important for DPOTrainer
   seed: 0
 
 wandb:
-  wandb_project: "dpo-lora"
-  run_name: "pythia-2.8b-rebel-lora-${now:%Y-%m-%d-%H-%M-%S}"
+  wandb_project: "dpo-full"
+  run_name: "pythia-2.8b-${dpo.loss_type}-${now:%Y-%m-%d-%H-%M-%S}"
   save_files: false # Set to true to save adapter checkpoints to wandb
 
 # -- Hydra Run Configuration --

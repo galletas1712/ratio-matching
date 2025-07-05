@@ -33,7 +33,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval_steps", type=int, default=50)
     parser.add_argument("--eval_step_cap", type=int, default=200)
-    parser.add_argument("--save_steps", type=int, default=20000)
+    parser.add_argument("--save_steps", type=int, default=60000)
     parser.add_argument("--device", type=str, default="cuda")
     # Resume from checkpoint
     parser.add_argument(

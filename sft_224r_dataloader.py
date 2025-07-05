@@ -1,3 +1,5 @@
+import torch
+
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer
@@ -49,9 +51,6 @@ class SFTDataset(Dataset):
     ):
         self.dataset_name = dataset_name
         self.split = split
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name_or_path, padding_side="left"
-        )
 
         self.max_seq_length = max_seq_length
         # Load the raw dataset metadata, but don't tokenize yet
@@ -69,14 +68,7 @@ class SFTDataset(Dataset):
         sample = example["chosen"]
         prefix, suffix = split_prefix_last_assistant(sample)
 
-        input_ids = self.tokenizer(text=prefix+suffix, max_length=self.max_seq_length, truncation=True)["input_ids"]
-        prefix_input_ids = self.tokenizer(text=prefix, max_length=self.max_seq_length, truncation=True)["input_ids"]
-
-        # Our SFT supervision signal should only come from the decoded tokens after (last assistant message)
-        # Note that we don't pad this in the dataset but we do pad it in the collate_fn
-        labels = input_ids[len(prefix_input_ids) :]
-
-        return input_ids, labels
+        return prefix, suffix
 
 
 def get_sft_dataloader(
@@ -87,32 +79,70 @@ def get_sft_dataloader(
     batch_size: int,
 ):
     assert split in ["train", "test"], "Split must be 'train' or 'test'."
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, padding_side="left")
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name_or_path,
+    )
     tokenizer.pad_token_id = tokenizer.eos_token_id
     print(tokenizer.pad_token_id, tokenizer.eos_token_id)
     assert (
         tokenizer.pad_token == tokenizer.eos_token
         ), f"Tokenizer's pad_token should be the same as eos_token, pad_token: {tokenizer.pad_token}, eos_token: {tokenizer.eos_token}"
 
-    def collate_fn(
-        batch: list[tuple[list[int], list[int]]],
-    ) -> dict[str, list[list[int]]]:
-        max_input_len = max(len(x[0]) for x in batch)
-        input_ids_padded = [
-            [tokenizer.pad_token_id] * (max_input_len - len(x[0])) + x[0] for x in batch
-        ]
-        attention_mask = [
-            [0] * (max_input_len - len(x[0])) + [1] * len(x[0]) for x in batch
-        ]
-        labels_padded = [
-            [IGNORE_LABEL] * (max_input_len - len(x[1])) + x[1] for x in batch
-        ]
-        return {
-            "input_ids": input_ids_padded,
-            "attention_mask": attention_mask,
-            "labels": labels_padded,
-        }
+    def collate_fn(batch: list[tuple[str, str]]):
+        prefixes, suffixes = zip(*batch)
+        B = len(batch)
+        eos_id   = tokenizer.eos_token_id
+        pad_id   = tokenizer.pad_token_id
 
+        # 1) Tokenize **without** any padding so we get raw lists of IDs
+        pre_enc = tokenizer(
+            list(prefixes),
+            padding=False,
+            truncation=True,
+            max_length=max_seq_length,
+            return_tensors=None,
+        )
+        suf_enc = tokenizer(
+            list(suffixes),
+            padding=False,
+            truncation=True,
+            max_length=max_seq_length,
+            return_tensors=None,
+        )
+        pre_ids = pre_enc["input_ids"]   # List[List[int]]
+        suf_ids = suf_enc["input_ids"]    # List[List[int]]
+
+        # 2) Figure out how long each final sequence will be (prefix+suffix+EOS)
+        lengths = [len(p) + len(s) + 1 for p, s in zip(pre_ids, suf_ids)]
+        max_len = max(lengths)
+
+        # 3) Allocate tensors of shape (B, max_len)
+        input_ids      = torch.full((B, max_len), pad_id,   dtype=torch.long)
+        attention_mask = torch.zeros((B, max_len),          dtype=torch.long)
+        labels         = torch.full((B, max_len), IGNORE_LABEL, dtype=torch.long)
+
+        # 4) Fill them in example by example
+        for i, (p, s, L) in enumerate(zip(pre_ids, suf_ids, lengths)):
+            pre_len = len(p)
+            suf_len = len(s)
+            # — inputs: [ prefix | suffix | EOS ] then pad
+            input_ids[i, :pre_len]                = torch.tensor(p, dtype=torch.long)
+            input_ids[i, pre_len : pre_len+suf_len] = torch.tensor(s, dtype=torch.long)
+            input_ids[i, pre_len+suf_len]         = eos_id
+
+            # — attention mask through the EOS
+            attention_mask[i, :L] = 1
+
+            # — labels: ignore-prefix, then [ suffix | EOS ], then ignore-pad
+            labels[i, pre_len : pre_len+suf_len] = torch.tensor(s, dtype=torch.long)
+            labels[i, pre_len+suf_len]           = eos_id
+            # (everything else in `labels` stays at IGNORE_LABEL)
+
+        return {
+            "input_ids":      input_ids,
+            "attention_mask": attention_mask,
+            "labels":         labels,
+        }
     dataset = SFTDataset(
         model_name_or_path=model_name_or_path,
         split=split,

@@ -1,6 +1,7 @@
 import argparse
 import torch
 from sft_224r_dataloader import get_sft_dataloader, IGNORE_LABEL
+from transformers import AutoTokenizer
 
 
 def debug_dataloader(model_name, dataset_name, split, max_seq_len, batch_size, num_batches=1):
@@ -14,12 +15,15 @@ def debug_dataloader(model_name, dataset_name, split, max_seq_len, batch_size, n
         max_seq_length=max_seq_len,
         batch_size=batch_size,
     )
-    tokenizer = dataloader.dataset.tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+    )
 
     for batch_idx, batch in enumerate(dataloader):
         if batch_idx >= num_batches:
             break
         print(f"\n=== Batch {batch_idx} ===")
+        print(tokenizer.eos_token_id, tokenizer.pad_token_id)
 
         # Convert to tensors for easy slicing
         input_ids = torch.tensor(batch["input_ids"])

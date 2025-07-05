@@ -137,7 +137,7 @@ def main(cfg: DictConfig) -> None:
     else:
         print("No SFT adapter path specified. Using the base model directly for DPO.")
 
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model.name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model.tokenizer, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         print("Set tokenizer pad_token to eos_token")
