@@ -50,7 +50,7 @@ training:
   eval_strategy: "steps"
   eval_steps: 100 # Evaluate less frequently than SFT potentially
   save_strategy: "steps"
-  save_steps: 200
+  save_steps: 800
   logging_steps: 10
   warmup_steps: 100
   lr_scheduler_type: "linear"
