@@ -91,7 +91,7 @@ class SFTDataset(Dataset):
         return len(self.raw_dataset)  # type: ignore
 
     def __getitem__(self, idx):
-        assert isinstance(self.raw_dataset, Dataset)
+        # assert isinstance(self.raw_dataset, Dataset)
         example = self.raw_dataset[idx]
         # For SFT, we expect a 'chosen' column with the full conversation
         sample = example["chosen"]

@@ -3,7 +3,7 @@ defaults:
 
 # Model Configuration
 model:
-  name: "EleutherAI/pythia-2.8b"
+  name: "EleutherAI/pythia-70m"
   max_seq_len: 2048
   # For LoRA, target modules depend on the model architecture.
   lora_target_modules:
