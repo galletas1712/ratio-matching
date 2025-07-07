@@ -1,65 +1,63 @@
-# config/config.yaml
-
 defaults:
   - _self_
 
-# -- Model Configuration --
+# Model Configuration
 model:
   name: "EleutherAI/pythia-2.8b"
-
+  max_seq_len: 2048
   # For LoRA, target modules depend on the model architecture.
-  # These are typical for Pythia/GPT-NeoX. Use print(model) to inspect your model's layers.
   lora_target_modules:
     - "query_key_value"
     - "dense"
     - "dense_h_to_4h"
     - "dense_4h_to_h"
 
-# -- Dataset Configuration --
+# Dataset Configuration
 dataset:
-  name: "claserken/hhrlhf-rejudged"
-  sft_column: "chosen"
-  eval_size_limit: null
-  train_size_limit: null
+  name: "Anthropic/hh-rlhf"
+  # For SFT, we train on the 'chosen' column, filtering out rows where it's empty/None
+  split_logic: "train" # 'train' for chosen, can be adapted if needed
 
-# -- LoRA Configuration --
+# LoRA Configuration
 lora:
-  enabled: true       # Set to true to enable LoRA, false for full fine-tuning
-  r: 32               # LoRA rank
-  lora_alpha: 32      # LoRA alpha scaling factor (often 2*r)
-  lora_dropout: 0.05      # Dropout probability for LoRA layers
-  bias: "none"        # Options: "none", "lora_only", "all"
-  task_type: "CAUSAL_LM" # Should be CAUSAL_LM for SFT on decoder models
+  enabled: true
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  bias: "none"
+  task_type: "CAUSAL_LM"
 
-# -- Training Arguments --
+# Training Arguments
 training:
-  output_dir: ???
-  per_device_train_batch_size: 8
-  per_device_eval_batch_size: 32
-  gradient_accumulation_steps: 32
-  learning_rate: 5e-6 # LoRA often tolerates slightly higher LR than full fine-tuning (adjust as needed)
-  num_train_epochs: 3
+  output_dir: ??? # Managed by Hydra
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 256
+  learning_rate: 5.0e-5
+  num_train_epochs: 1
+  max_grad_norm: 15.0
   logging_strategy: "steps"
   logging_first_step: true
   eval_strategy: "steps"
-  eval_steps: 50
+  eval_steps: 100
   save_strategy: "steps"
-  save_steps: 200
+  save_steps: 800
   logging_steps: 10
-  warmup_steps: 150
+  warmup_steps: 100
   lr_scheduler_type: "linear"
-  optim: "adamw_torch" # Standard AdamW works well for LoRA, but RMSProp is more memory efficient
-  fp16: true
+  optim: "adamw_torch"
+  bf16: true
   report_to: "wandb"
   remove_unused_columns: false
-  seed: 0
-  
+  seed: 42
+
+# W&B Configuration
 wandb:
-  wandb_project: "sft-lora"
-  run_name: "pythia-2.8b-sft-lora-debug-${now:%Y-%m-%d-%H-%M-%S}"
+  project: "sft-full"
+  run_name: "pythia-2.8b-sft-${now:%Y-%m-%d-%H-%M-%S}"
   save_files: false
 
-# -- Hydra Run Configuration --
+# Hydra Run Configuration
 hydra:
   run:
     dir: outputs/sft/${now:%Y-%m-%d}/${now:%H-%M-%S}

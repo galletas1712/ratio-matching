@@ -11,7 +11,7 @@ def extract_anthropic_prompt(prompt_and_response: str) -> str:
 
 
 # Utility: split into prompt string, chosen, and rejected continuations
-def split_prompt_and_responses(ex: Dict[str, str]) -> (str, str, str):
+def split_prompt_and_responses(ex: Dict[str, str]) -> tuple[str, str, str]:
     prompt_str = extract_anthropic_prompt(ex["chosen"])
     chosen_resp = ex["chosen"][len(prompt_str) :]
     rejected_resp = ex["rejected"][len(prompt_str) :]

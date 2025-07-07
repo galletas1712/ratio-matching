@@ -1,7 +1,8 @@
 import argparse
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import PeftModel # Import PeftModel
+from transformers.models.auto.modeling_auto import AutoModelForCausalLM
+from transformers.models.auto.tokenization_auto import AutoTokenizer
+from peft import PeftModel
 
 def main(args):
     # Determine the device
@@ -30,7 +31,7 @@ def main(args):
     if args.sft_adapter_dir:
         print(f"Loading and merging SFT adapter from {args.sft_adapter_dir}...")
         model = PeftModel.from_pretrained(model, args.sft_adapter_dir)
-        model = model.merge_and_unload()
+        model = model.merge_and_unload()  # type: ignore
         print("SFT adapter merged successfully.")
 
     # Load the primary LoRA adapter (e.g., DPO adapter) from checkpoint_dir
@@ -40,9 +41,6 @@ def main(args):
         # Note: PeftModel automatically handles merging or prepares the model for inference with the adapter.
         # No explicit merge_and_unload() needed for the final adapter unless you intend to save
         # a new fully merged model from this script.
-
-        # Ensure the final model is on the correct device (device_map="auto" should handle this, but explicit .to(device) can be a fallback)
-        # model.to(device) # Usually not needed with device_map="auto"
 
     print("Model and tokenizer loaded successfully.")
 

@@ -1,25 +1,23 @@
+"""
+Run script for SFT.
+"""
+
+import math
 import os
+import random
 
 import hydra
+import torch
+import wandb
 from datasets import load_dataset
 from omegaconf import DictConfig, OmegaConf
-from peft import (
-    LoraConfig,  # Import LoraConfig
-    PeftModel,
-)
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    TrainerCallback,
-    TrainingArguments,
-    # BitsAndBytesConfig # Keep commented unless adding quantization (QLoRA)
-)
-from trl import SFTTrainer
+from peft import LoraConfig, get_peft_model
+from torch.utils.data import DataLoader, Dataset
+from transformers.models.auto.modeling_auto import AutoModelForCausalLM
+from transformers.models.auto.tokenization_auto import AutoTokenizer
+from transformers.optimization import get_linear_schedule_with_warmup
 
-import wandb
-
-# Check for TOKENIZERS_PARALLELISM environment variable
-os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get("TOKENIZERS_PARALLELISM", "false")
+IGNORE_LABEL = -100
 
 
 def print_trainable_parameters(model):
@@ -37,149 +35,334 @@ def print_trainable_parameters(model):
     )
 
 
-# --- HYDRA MAIN FUNCTION ---
+def split_prefix_last_assistant(conv: str) -> tuple[str, str]:
+    """
+    Splits a conversation string into:
+      - prefix: everything before the last "Assistant:" block
+      - last_msg: the content of that last assistant message
+
+    It looks for the last occurrence of "Assistant:", then—if there is a following "Human:"—
+    stops the assistant message there.
+    """
+    marker = "Assistant:"
+    # find start of last Assistant:
+    idx = conv.rfind(marker)
+    if idx == -1:
+        raise ValueError("No 'Assistant:' speaker found in the input.")
+
+    # compute where the assistant message text actually starts
+    start = idx + len(marker)
+    # see if there's a next Human: after that
+    next_human = conv.find("Human:", start)
+
+    if next_human != -1:
+        # there's another Human message -> assistant text ends just before it
+        last_msg = conv[start:next_human].strip()
+    else:
+        # no following Human: -> take everything to the end
+        last_msg = conv[start:].strip()
+
+    # prefix is everything up to (but not including) that last "Assistant:"
+    prefix = conv[:idx].rstrip()
+    last_msg = "Assistant: " + last_msg
+
+    return prefix, last_msg
+
+
+class SFTDataset(Dataset):
+    def __init__(
+        self,
+        split: str,
+        dataset_name: str,
+        max_seq_length: int,
+    ):
+        self.dataset_name = dataset_name
+        self.split = split
+
+        self.max_seq_length = max_seq_length
+        # Load the raw dataset metadata, but don't tokenize yet
+        print("Loading dataset:", self.dataset_name)
+        self.raw_dataset = load_dataset(self.dataset_name, split=self.split)
+        print("Raw dataset loaded:", self.raw_dataset)
+
+    # _load_and_tokenize_dataset is no longer needed here as a separate pre-processing step
+
+    def __len__(self):
+        return len(self.raw_dataset)  # type: ignore
+
+    def __getitem__(self, idx):
+        assert isinstance(self.raw_dataset, Dataset)
+        example = self.raw_dataset[idx]
+        # For SFT, we expect a 'chosen' column with the full conversation
+        sample = example["chosen"]
+        assert isinstance(sample, str), f"Expected string, got {type(sample)}"
+        # We train on the final assistant turn
+        prefix, suffix = split_prefix_last_assistant(sample)
+
+        return prefix, suffix
+
+
+def get_sft_dataloader(
+    model_name_or_path: str,
+    dataset_name: str,
+    split: str,
+    max_seq_length: int,
+    batch_size: int,
+):
+    assert split in ["train", "test"], "Split must be 'train' or 'test'."
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name_or_path,
+    )
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+    print(tokenizer.pad_token_id, tokenizer.eos_token_id)
+    assert (
+        tokenizer.pad_token == tokenizer.eos_token
+    ), f"Tokenizer's pad_token should be the same as eos_token, pad_token: {tokenizer.pad_token}, eos_token: {tokenizer.eos_token}"
+
+    def collate_fn(batch: list[tuple[str, str]]):
+        prefixes, suffixes = zip(*batch)
+        B = len(batch)
+        eos_id = tokenizer.eos_token_id
+        pad_id = tokenizer.pad_token_id
+
+        # Tokenize **without** any padding so we get raw lists of IDs
+        pre_enc = tokenizer(
+            list(prefixes),
+            padding=False,
+            truncation=True,
+            max_length=max_seq_length,
+            return_tensors=None,
+        )
+        suf_enc = tokenizer(
+            list(suffixes),
+            padding=False,
+            truncation=True,
+            max_length=max_seq_length,
+            return_tensors=None,
+        )
+        pre_ids = pre_enc["input_ids"]  # List[List[int]]
+        suf_ids = suf_enc["input_ids"]  # List[List[int]]
+
+        # Figure out how long each final sequence will be (prefix+suffix+EOS)
+        lengths = [len(p) + len(s) + 1 for p, s in zip(pre_ids, suf_ids)]
+        max_len = max(lengths)
+
+        # Allocate tensors of shape (B, max_len)
+        input_ids = torch.full((B, max_len), pad_id, dtype=torch.long)
+        attention_mask = torch.zeros((B, max_len), dtype=torch.long)
+        labels = torch.full((B, max_len), IGNORE_LABEL, dtype=torch.long)
+
+        # Fill them in example by example
+        for i, (p, s, L) in enumerate(zip(pre_ids, suf_ids, lengths)):
+            pre_len = len(p)
+            suf_len = len(s)
+            # — inputs: [ prefix | suffix | EOS ] then pad
+            input_ids[i, :pre_len] = torch.tensor(p, dtype=torch.long)
+            input_ids[i, pre_len : pre_len + suf_len] = torch.tensor(
+                s, dtype=torch.long
+            )
+            input_ids[i, pre_len + suf_len] = eos_id
+
+            # attention mask through the EOS
+            attention_mask[i, :L] = 1
+
+            # labels: ignore-prefix, then [ suffix | EOS ], then ignore-pad
+            labels[i, pre_len : pre_len + suf_len] = torch.tensor(s, dtype=torch.long)
+            labels[i, pre_len + suf_len] = eos_id
+            # everything else in `labels` stays at IGNORE_LABEL
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
+    dataset = SFTDataset(
+        split=split,
+        dataset_name=dataset_name,
+        max_seq_length=max_seq_length,
+    )
+
+    dataloader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn
+    )
+
+    return dataloader
+
+
+def eval(model, dataloader, device, eval_step_cap):
+    model.eval()
+    total_loss = 0.0
+    with torch.no_grad():
+        for step, data in enumerate(dataloader):
+            if step >= eval_step_cap:
+                break
+            input_ids = torch.tensor(data["input_ids"], dtype=torch.long, device=device)
+            labels = torch.tensor(data["labels"], dtype=torch.long, device=device)
+            attention_mask = torch.tensor(
+                data["attention_mask"], dtype=torch.long, device=device
+            )
+            outputs = model(
+                input_ids=input_ids, labels=labels, attention_mask=attention_mask
+            )
+            total_loss += outputs.loss.item()
+    return total_loss / min(len(dataloader), eval_step_cap)
+
+
 @hydra.main(version_base=None, config_path="config", config_name="sft_config")
 def main(cfg: DictConfig) -> None:
+    """Main SFT training function driven by Hydra configuration."""
+    # 1. Initialize W&B
     wandb.init(
-        project=cfg.wandb.wandb_project,
+        project=cfg.wandb.project,
         name=cfg.wandb.run_name,
-        config=OmegaConf.to_container(cfg),
+        config=OmegaConf.to_container(cfg, resolve=True),
         save_code=True,
     )
 
+    # Set output directory based on WandB run
     output_dir = wandb.run.dir
     cfg.training.output_dir = output_dir
-    
-    # output_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
-    
-    class SaveAdapterCallback(TrainerCallback):
-        def on_save(self, args, state, control, **kwargs):
-            model = kwargs["model"]
-            # only act on PeftModel (i.e. base+LoRA adapter)
-            if isinstance(model, PeftModel):
-                ckpt_dir    = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
-                adapter_dir = os.path.join(ckpt_dir, "adapter_only")
-                # this will create adapter_dir/adapter_config.json and pytorch_model.bin
-                model.save_pretrained(adapter_dir)
-                if cfg.wandb.save_files:
-                    wandb.save(os.path.join(adapter_dir, "*"), base_path=args.output_dir)
-            return control
-
-    """Main training function driven by Hydra configuration."""
-    print("-------------------- Configuration --------------------")
+    print(f"Output directory: {output_dir}")
+    print("-------------------- Configuration (SFT) --------------------")
     print(OmegaConf.to_yaml(cfg))
-    print("-------------------------------------------------------")
+    print("-------------------------------------------------------------")
 
-    # 2. Load Dataset
-    print(f"Loading dataset: {cfg.dataset.name}")
-    train_dataset = load_dataset(cfg.dataset.name, split="train")
-    if "train_size_limit" in cfg.dataset and cfg.dataset.train_size_limit:
-        train_dataset = train_dataset.select(range(cfg.dataset.train_size_limit))
+    # 2. Seed for reproducibility
+    random.seed(cfg.training.seed)
+    torch.manual_seed(cfg.training.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.training.seed)
 
-    eval_dataset = load_dataset(cfg.dataset.name, split="test")
-    if "eval_size_limit" in cfg.dataset and cfg.dataset.eval_size_limit:
-        eval_dataset = eval_dataset.select(range(cfg.dataset.eval_size_limit))
-
-    print("Dataset loaded.")
-    print(f"Train dataset size: {len(train_dataset)}")
-    print(f"Eval dataset size: {len(eval_dataset)}")
-
-    model = AutoModelForCausalLM.from_pretrained(cfg.model.name, trust_remote_code=True)
-
-    # 3. Load Tokenizer and Model
-    print(f"Loading model and tokenizer: {cfg.model.name}")
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model.name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        print("Set tokenizer pad_token to eos_token")
-    tokenizer.padding_side = "right"
-
-    tokenizer.model_max_length = model.config.max_position_embeddings
-    effective_max_length = tokenizer.model_max_length
-    print(
-        f"Tokenizer model_max_length (used by default if not overridden): {effective_max_length}"
+    # 3. Load model and tokenizer
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Loading model: {cfg.model.name} on device: {device}")
+    model_kwargs = {
+        "trust_remote_code": True,
+        "torch_dtype": torch.bfloat16 if cfg.training.bf16 else torch.float32,
+    }
+    model = AutoModelForCausalLM.from_pretrained(cfg.model.name, **model_kwargs).to(
+        device
     )
 
-    # 5. Setup PEFT/LoRA Config (Conditionally based on config)
-    peft_config = None
+    # 4. Configure LoRA if enabled
     if cfg.lora.enabled:
-        print("LoRA is enabled. Setting up LoraConfig.")
-        # Ensure target_modules is a standard list
-        target_modules_list = list(cfg.model.lora_target_modules)
-        peft_config = LoraConfig(
+        print("Applying LoRA configuration...")
+        lora_config = LoraConfig(
             r=cfg.lora.r,
             lora_alpha=cfg.lora.lora_alpha,
             lora_dropout=cfg.lora.lora_dropout,
-            target_modules=target_modules_list,
             bias=cfg.lora.bias,
-            task_type=cfg.lora.task_type,  # Should be CAUSAL_LM
+            task_type=cfg.lora.task_type,
+            target_modules=list(cfg.model.lora_target_modules),
         )
-        print(f"LoraConfig: {peft_config}")
-    else:
-        print("LoRA is disabled. Performing full fine-tuning.")
+        model = get_peft_model(model, lora_config)
+        print_trainable_parameters(model)
 
-    # 6. Training Arguments (Reads from config)
-    print("Setting up Training Arguments")
-    cfg.training.output_dir = output_dir
-    training_arguments = TrainingArguments(**cfg.training)
-
-    # 7. Initialize SFTTrainer (Reads from config where applicable)
-    print("Initializing SFTTrainer")
-    trainer = SFTTrainer(
-        model=model,
-        args=training_arguments,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        peft_config=peft_config,  # Pass the LoraConfig object (or None)
-        processing_class=tokenizer,
-        formatting_func=lambda x: x[cfg.dataset.sft_column],
-        callbacks=[SaveAdapterCallback],
-        # max_seq_length is not passed directly
+    # 5. Load datasets
+    print("Loading datasets...")
+    train_dataloader = get_sft_dataloader(
+        model_name_or_path=cfg.model.name,
+        dataset_name=cfg.dataset.name,
+        split="train",
+        max_seq_length=cfg.model.max_seq_len,
+        batch_size=cfg.training.per_device_train_batch_size,
+    )
+    test_dataloader = get_sft_dataloader(
+        model_name_or_path=cfg.model.name,
+        dataset_name=cfg.dataset.name,
+        split="test",
+        max_seq_length=cfg.model.max_seq_len,
+        batch_size=cfg.training.per_device_eval_batch_size,
     )
 
-    print("Model parameters:")
-    print(model)
-    print_trainable_parameters(model)
-
-    # Run baseline evaluation first
-    print("Running baseline evaluation...")
-    baseline_metrics = trainer.evaluate()
-    trainer.log_metrics("eval_baseline", baseline_metrics)
-    trainer.save_metrics("eval_baseline", baseline_metrics)
-
-    # 8. Train
-    print(
-        f"Starting training ({'LoRA enabled' if cfg.lora.enabled else 'Full fine-tuning'})..."
+    # 6. Setup optimizer and scheduler
+    steps_per_epoch = math.ceil(
+        len(train_dataloader) / cfg.training.gradient_accumulation_steps
     )
-    if cfg.training.num_train_epochs > 0:
-        train_result = trainer.train()
-        metrics = train_result.metrics
-        trainer.log_metrics("train", metrics)
-        trainer.save_metrics("train", metrics)
-    else:
-        print("Skipping training as num_train_epochs <= 0")
-
-    # 9. Save final model
-    print(
-        f"Saving final model ({'LoRA adapter' if cfg.lora.enabled else 'Full weights'})..."
-    )
-    adapter_directory = os.path.join(
-        output_dir, "lora_adapter" if cfg.lora.enabled else "final_model"
-    )
-    trainer.save_model(adapter_directory)
-    if cfg.wandb.save_files:
-        wandb.save(os.path.join(adapter_directory, "*"), base_path=output_dir)
-    print(
-        f"{'PEFT' if cfg.lora.enabled else 'Final model'} checkpoint: model saved to {adapter_directory}"
+    total_steps = steps_per_epoch * cfg.training.num_train_epochs
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.training.learning_rate)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=cfg.training.warmup_steps,
+        num_training_steps=total_steps,
     )
 
-    if cfg.lora.enabled:
-        merged = trainer.model.merge_and_unload()
-        merged_dir = os.path.join(output_dir, "lora_merged")
-        merged.save_pretrained(merged_dir)
-        if cfg.wandb.save_files:
-            wandb.save(os.path.join(merged_dir, "*"), base_path=output_dir)
-        print(f"Finished saving the merged model to: {merged_dir}")
+    # 7. Initial evaluation
+    print("Running initial evaluation...")
+    init_loss = eval(model, test_dataloader, device, 200)  # Capped eval steps
+    print(f"Initial Eval Loss: {init_loss:.4f}")
+    wandb.log({"eval/initial_loss": init_loss})
+
+    # 8. Training loop
+    global_step = 0
+    for epoch in range(cfg.training.num_train_epochs):
+        model.train()
+        for step, data in enumerate(train_dataloader):
+            input_ids = data["input_ids"].to(device)
+            labels = data["labels"].to(device)
+            attention_mask = data["attention_mask"].to(device)
+
+            outputs = model(
+                input_ids=input_ids, labels=labels, attention_mask=attention_mask
+            )
+            loss = outputs.loss / cfg.training.gradient_accumulation_steps
+            loss.backward()
+
+            if (step + 1) % cfg.training.gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), cfg.training.max_grad_norm
+                )
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                global_step += 1
+
+                # Logging
+                if global_step % cfg.training.logging_steps == 0:
+                    print(
+                        f"Epoch {epoch} | Step {global_step} | Loss {loss.item() * cfg.training.gradient_accumulation_steps:.4f}"
+                    )
+                    wandb.log(
+                        {
+                            "train/loss": loss.item()
+                            * cfg.training.gradient_accumulation_steps,
+                            "train/lr": scheduler.get_last_lr()[0],
+                            "train/step": global_step,
+                            "epoch": epoch,
+                        }
+                    )
+
+                # Evaluation
+                if global_step % cfg.training.eval_steps == 0:
+                    model.eval()
+                    val_loss = eval(model, test_dataloader, device, 200)  # Capped
+                    print(f"--> Eval Loss @ step {global_step}: {val_loss:.4f}")
+                    wandb.log({"eval/loss": val_loss, "train/step": global_step})
+                    model.train()
+
+                # Checkpoint saving
+                if global_step % cfg.training.save_steps == 0:
+                    ckpt_path = os.path.join(output_dir, f"step-{global_step}")
+                    os.makedirs(ckpt_path, exist_ok=True)
+                    # Save model adapter
+                    model.save_pretrained(ckpt_path)
+
+                    print(f"Checkpoint saved to {ckpt_path}")
+                    if cfg.wandb.save_files:
+                        art = wandb.Artifact(f"model-step-{global_step}", type="model")
+                        art.add_dir(ckpt_path)
+                        wandb.log_artifact(art)
+
+    # Final save
+    final_path = os.path.join(output_dir, "final_checkpoint")
+    model.save_pretrained(final_path)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model.name)
+    tokenizer.save_pretrained(final_path)
+    print(f"Final model saved to {final_path}")
+
+    if wandb.run is not None:
+        wandb.finish()
 
 
 if __name__ == "__main__":
